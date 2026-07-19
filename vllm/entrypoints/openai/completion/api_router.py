@@ -6,6 +6,7 @@ from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
@@ -29,6 +30,41 @@ ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
 def completion(request: Request) -> OpenAIServingCompletion | None:
     return request.app.state.openai_serving_completion
+
+
+class ToggleSpeculativeRequest(BaseModel):
+    enabled: bool
+
+
+@router.post(
+    "/v1/engine/speculative_decoding",
+    responses={
+        HTTPStatus.OK.value: {"description": "Successfully toggled"},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def toggle_speculative_decoding(
+    request: ToggleSpeculativeRequest,
+    raw_request: Request,
+):
+    try:
+        engine = raw_request.app.state.engine_client
+        updated = await engine.toggle_speculative_decoding(request.enabled)
+        logger.info("Speculative decoding toggle requested: %s", request.enabled)
+
+        return JSONResponse(
+            content={
+                "status": "success" if updated else "ignored",
+                "speculative_decoding_enabled": request.enabled
+            },
+            status_code=HTTPStatus.OK.value,
+        )
+    except Exception as e:
+        logger.error(f"Error toggling speculative decoding: {e}")
+        return JSONResponse(
+            content={"error": str(e)},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
 
 
 @router.post(

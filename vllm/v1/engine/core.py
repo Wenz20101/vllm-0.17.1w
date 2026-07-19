@@ -151,7 +151,6 @@ class EngineCore:
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
         )
-        self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
@@ -213,6 +212,7 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        self._last_scheduler_output: SchedulerOutput | None = None
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -385,6 +385,7 @@ class EngineCore:
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
+        self._last_scheduler_output = None
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
@@ -404,6 +405,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._last_scheduler_output = scheduler_output
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -411,7 +413,13 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if not self.async_scheduling and self.use_spec_decode and model_executed:
+        scheduler_output = self._last_scheduler_output
+        if (
+            not self.async_scheduling
+            and model_executed
+            and scheduler_output is not None
+            and scheduler_output.spec_decode_enabled
+        ):
             # Take the draft token ids.
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
@@ -442,6 +450,7 @@ class EngineCore:
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
 
+        self._last_scheduler_output = None
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
@@ -507,6 +516,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._last_scheduler_output = scheduler_output
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -515,7 +525,7 @@ class EngineCore:
             # If we are doing speculative decoding with structured output,
             # we need to get the draft token ids from the prior step before
             # we can compute the grammar bitmask for the deferred request.
-            if self.use_spec_decode:
+            if deferred_scheduler_output.scheduled_spec_decode_tokens:
                 draft_token_ids = self.model_executor.take_draft_token_ids()
                 assert draft_token_ids is not None
                 # Update the draft token ids in the scheduler output to
@@ -575,6 +585,29 @@ class EngineCore:
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def toggle_speculative_decoding(self, enable: bool) -> bool:
+        """
+        Dynamically enable or disable speculative decoding.
+        This can be invoked by the API server via a UTILITY request.
+        """
+        if not self.scheduler.vllm_config.speculative_config:
+            logger.warning(
+                "Speculative decoding is not configured in this engine. "
+                "Ignoring toggle."
+            )
+            return False
+
+        if self.scheduler.enable_sd == enable:
+            return True
+
+        self.scheduler.enable_sd = enable
+        logger.info(
+            "Speculative decoding requested: %s. The change will apply to "
+            "new scheduler iterations.",
+            enable,
+        )
+        return True
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

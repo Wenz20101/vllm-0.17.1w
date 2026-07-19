@@ -68,23 +68,33 @@ class CudagraphDispatcher:
         # Default cudagraph_mode to NONE until initialize_cudagraph_keys is called
         self.cudagraph_mode = CUDAGraphMode.NONE
 
-    def _compute_bs_to_padded_graph_size(self) -> None:
+    @staticmethod
+    def _compute_bs_to_padded_graph_size_for_capture_sizes(
+        capture_sizes: list[int],
+    ) -> list[int]:
         """Pre-compute the mapping from batch size to padded graph size."""
-        max_size = self.compilation_config.max_cudagraph_capture_size
-        capture_sizes = self.compilation_config.cudagraph_capture_sizes
-        assert capture_sizes is not None, (
-            "Cudagraph capture sizes must be set when cudagraphs are enabled."
-        )
-        self._bs_to_padded_graph_size: list[int] = [0] * (max_size + 1)
+        max_size = capture_sizes[-1]
+        bs_to_padded_graph_size: list[int] = [0] * (max_size + 1)
         for end, start in zip(
             capture_sizes + [max_size + 1],
             [0] + capture_sizes,
         ):
             for bs in range(start, end):
                 if bs == start:
-                    self._bs_to_padded_graph_size[bs] = start
+                    bs_to_padded_graph_size[bs] = start
                 else:
-                    self._bs_to_padded_graph_size[bs] = end
+                    bs_to_padded_graph_size[bs] = end
+        return bs_to_padded_graph_size
+
+    def _compute_bs_to_padded_graph_size(self) -> None:
+        """Pre-compute the mapping from batch size to padded graph size."""
+        capture_sizes = self.compilation_config.cudagraph_capture_sizes
+        assert capture_sizes is not None, (
+            "Cudagraph capture sizes must be set when cudagraphs are enabled."
+        )
+        self._bs_to_padded_graph_size = (
+            self._compute_bs_to_padded_graph_size_for_capture_sizes(capture_sizes)
+        )
 
         # Validate that compile_sizes won't be changed by padding.
         # Only validate when cudagraphs are actually being used.
@@ -94,7 +104,7 @@ class CudagraphDispatcher:
         ):
             for size in self.compilation_config.compile_sizes:
                 size = int(size)
-                if size <= self.compilation_config.max_cudagraph_capture_size:
+                if size < len(self._bs_to_padded_graph_size):
                     padded = self._bs_to_padded_graph_size[size]
                     if padded != size:
                         raise ValueError(
@@ -125,16 +135,55 @@ class CudagraphDispatcher:
             # No specialization: only capture graphs with LoRA active
             return [lora_config.max_loras + 1]
 
+    def _get_non_spec_decode_capture_sizes(self) -> list[int]:
+        """Return the qlen=1 decode graph sizes used by a non-spec engine.
+
+        Spec decode rounds the global cudagraph_capture_sizes up to multiples
+        of num_speculative_tokens + 1. For a runtime toggle back to ordinary
+        decode, we still need the unrounded qlen=1 sizes (1, 2, 4, 8, ...).
+        """
+        max_size = min(
+            self.vllm_config.scheduler_config.max_num_seqs,
+            self.compilation_config.max_cudagraph_capture_size,
+        )
+        if max_size <= 0:
+            return []
+
+        if getattr(self.vllm_config, "performance_mode", None) == "interactivity":
+            sizes = list(range(1, min(max_size, 32) + 1))
+        else:
+            sizes = [size for size in (1, 2, 4) if size <= max_size]
+
+        if max_size >= 8:
+            sizes.extend(range(8, min(max_size + 1, 256), 8))
+        if max_size >= 256:
+            sizes.extend(range(256, max_size + 1, 16))
+
+        return sorted(set(sizes))
+
     def _create_padded_batch_descriptor(
         self,
         num_tokens: int,
         uniform_decode: bool,
         has_lora: bool,
         num_active_loras: int = 0,
+        uniform_decode_query_len: int | None = None,
+        exact_num_tokens: bool = False,
+        aux_hidden_state_outputs: bool = False,
+        use_non_spec_decode_padding: bool = False,
     ) -> BatchDescriptor:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-        uniform_decode_query_len = self.uniform_decode_query_len
-        num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]
+        uniform_decode_query_len = (
+            uniform_decode_query_len or self.uniform_decode_query_len
+        )
+        bs_to_padded_graph_size = (
+            self._bs_to_non_spec_decode_padded_graph_size
+            if use_non_spec_decode_padding
+            else self._bs_to_padded_graph_size
+        )
+        num_tokens_padded = (
+            num_tokens if exact_num_tokens else bs_to_padded_graph_size[num_tokens]
+        )
 
         if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
             num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
@@ -142,11 +191,14 @@ class CudagraphDispatcher:
         else:
             uniform_decode = False
             num_reqs = min(num_tokens_padded, max_num_seqs)
+            uniform_decode_query_len = 1
 
         return BatchDescriptor(
             num_tokens=num_tokens_padded,
             num_reqs=num_reqs,
             uniform=uniform_decode,
+            uniform_decode_query_len=uniform_decode_query_len,
+            aux_hidden_state_outputs=aux_hidden_state_outputs,
             has_lora=has_lora,
             num_active_loras=num_active_loras,
         )
@@ -178,6 +230,18 @@ class CudagraphDispatcher:
         self.captured_lora_counts = [
             lora_count for lora_count in lora_cases if lora_count
         ]
+        uses_aux_hidden_states = (
+            self.vllm_config.speculative_config is not None
+            and self.vllm_config.speculative_config.method
+            in ("eagle3", "extract_hidden_states")
+        )
+        piecewise_aux_hidden_state_cases = [True] if uses_aux_hidden_states else [False]
+        spec_decode_aux_hidden_state_cases = (
+            [True] if uses_aux_hidden_states else [False]
+        )
+        exact_decode_aux_hidden_state_cases = (
+            [False, True] if uses_aux_hidden_states else [False]
+        )
 
         # Note: we create all valid keys for cudagraph here but do not
         # guarantee all keys would be used. For example, if we allow lazy
@@ -186,11 +250,17 @@ class CudagraphDispatcher:
             assert self.compilation_config.cudagraph_capture_sizes is not None, (
                 "Cudagraph capture sizes must be set when mixed mode is enabled."
             )
-            for bs, num_active_loras in product(
-                self.compilation_config.cudagraph_capture_sizes, lora_cases
+            for bs, num_active_loras, aux_hidden_state_outputs in product(
+                self.compilation_config.cudagraph_capture_sizes,
+                lora_cases,
+                piecewise_aux_hidden_state_cases,
             ):
                 batch_desc = self._create_padded_batch_descriptor(
-                    bs, False, num_active_loras > 0, num_active_loras
+                    bs,
+                    False,
+                    num_active_loras > 0,
+                    num_active_loras,
+                    aux_hidden_state_outputs=aux_hidden_state_outputs,
                 )
                 # Only relax for PIECEWISE mode. FULL mode needs exact num_reqs
                 # because FA3's scheduler_metadata computation depends on it.
@@ -204,6 +274,7 @@ class CudagraphDispatcher:
             cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
             and cudagraph_mode.separate_routine()
         ):
+            non_spec_decode_capture_sizes: list[int] = []
             max_num_tokens = (
                 uniform_decode_query_len
                 * self.vllm_config.scheduler_config.max_num_seqs
@@ -216,15 +287,53 @@ class CudagraphDispatcher:
                 for x in self.compilation_config.cudagraph_capture_sizes
                 if x <= max_num_tokens and x >= uniform_decode_query_len
             ]
-            for bs, num_active_loras in product(
-                cudagraph_capture_sizes_for_decode, lora_cases
+            for bs, num_active_loras, aux_hidden_state_outputs in product(
+                cudagraph_capture_sizes_for_decode,
+                lora_cases,
+                spec_decode_aux_hidden_state_cases,
             ):
                 self.add_cudagraph_key(
                     CUDAGraphMode.FULL,
                     self._create_padded_batch_descriptor(
-                        bs, True, num_active_loras > 0, num_active_loras
+                        bs,
+                        True,
+                        num_active_loras > 0,
+                        num_active_loras,
+                        aux_hidden_state_outputs=aux_hidden_state_outputs,
                     ),
                 )
+
+            # A speculative engine can be toggled into ordinary non-spec decode
+            # mode at runtime. Register the same query_len=1 decode graph set
+            # that a non-spec engine would have, so SD-as-NonSD does not fall
+            # back to eager for batch sizes larger than one.
+            if (
+                self.vllm_config.speculative_config is not None
+                and uniform_decode_query_len > 1
+            ):
+                non_spec_decode_capture_sizes = self._get_non_spec_decode_capture_sizes()
+                self._bs_to_non_spec_decode_padded_graph_size = (
+                    self._compute_bs_to_padded_graph_size_for_capture_sizes(
+                        non_spec_decode_capture_sizes
+                    )
+                )
+                for bs, num_active_loras, aux_hidden_state_outputs in product(
+                    non_spec_decode_capture_sizes,
+                    lora_cases,
+                    exact_decode_aux_hidden_state_cases,
+                ):
+                    self.add_cudagraph_key(
+                        CUDAGraphMode.FULL,
+                        self._create_padded_batch_descriptor(
+                            bs,
+                            True,
+                            num_active_loras > 0,
+                            num_active_loras,
+                            uniform_decode_query_len=1,
+                            aux_hidden_state_outputs=aux_hidden_state_outputs,
+                            use_non_spec_decode_padding=True,
+                        ),
+                    )
 
         self.keys_initialized = True
 
@@ -234,6 +343,9 @@ class CudagraphDispatcher:
         uniform_decode: bool = False,
         has_lora: bool = False,
         num_active_loras: int = 0,
+        uniform_decode_query_len: int | None = None,
+        exact_uniform_decode: bool = False,
+        aux_hidden_state_outputs: bool = False,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
@@ -274,6 +386,17 @@ class CudagraphDispatcher:
         ):
             return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
 
+        use_non_spec_decode_padding = (
+            self.vllm_config.speculative_config is not None
+            and uniform_decode
+            and (uniform_decode_query_len or self.uniform_decode_query_len) == 1
+            and hasattr(self, "_bs_to_non_spec_decode_padded_graph_size")
+        )
+        if use_non_spec_decode_padding and (
+            num_tokens >= len(self._bs_to_non_spec_decode_padded_graph_size)
+        ):
+            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+
         effective_num_active_loras = num_active_loras
         if has_lora and num_active_loras > 0:
             if self.specialize_lora_count:
@@ -294,7 +417,14 @@ class CudagraphDispatcher:
                 effective_num_active_loras = self.vllm_config.lora_config.max_loras + 1
 
         batch_desc = self._create_padded_batch_descriptor(
-            num_tokens, uniform_decode, has_lora, effective_num_active_loras
+            num_tokens,
+            uniform_decode,
+            has_lora,
+            effective_num_active_loras,
+            uniform_decode_query_len=uniform_decode_query_len,
+            exact_num_tokens=exact_uniform_decode and uniform_decode,
+            aux_hidden_state_outputs=aux_hidden_state_outputs,
+            use_non_spec_decode_padding=use_non_spec_decode_padding,
         )
 
         if CUDAGraphMode.FULL in allowed_modes:
@@ -338,6 +468,22 @@ class CudagraphDispatcher:
             if descs:
                 # Sort by num_tokens descending (largest first)
                 descs.sort(key=lambda d: d.num_tokens, reverse=True)
+                if (
+                    mode == CUDAGraphMode.FULL
+                    and self.vllm_config.speculative_config is not None
+                ):
+                    # Capture EAGLE3/spec-decode graphs before ordinary
+                    # qlen=1 Non-SD graphs. The target model's compiled
+                    # forward path must first see the aux-hidden-state output
+                    # structure; otherwise later SD iterations can miss aux
+                    # states even when the runtime flag is enabled.
+                    descs.sort(
+                        key=lambda d: (
+                            not d.aux_hidden_state_outputs,
+                            d.uniform_decode_query_len == 1,
+                            -d.num_tokens,
+                        )
+                    )
                 result.append((mode, descs))
 
         return result

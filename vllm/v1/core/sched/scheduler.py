@@ -263,6 +263,7 @@ class Scheduler(SchedulerInterface):
             )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+        self.enable_sd: bool = True if speculative_config else False
 
     def _mamba_block_aligned_split(
         self,
@@ -296,7 +297,7 @@ class Scheduler(SchedulerInterface):
             block_size = self.cache_config.block_size
             last_cache_position = request.num_tokens - request.num_tokens % block_size
             # eagle prune
-            if self.use_eagle:
+            if self.use_eagle and self.enable_sd:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:
@@ -326,6 +327,8 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        spec_decode_enabled = self.enable_sd
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -353,6 +356,8 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if not spec_decode_enabled and request.spec_token_ids:
+                request.spec_token_ids = []
 
             if (
                 request.num_output_placeholders > 0
@@ -371,7 +376,11 @@ class Scheduler(SchedulerInterface):
                 continue
 
             num_new_tokens = (
-                request.num_tokens_with_spec
+                (
+                    request.num_tokens_with_spec
+                    if spec_decode_enabled
+                    else request.num_tokens
+                )
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
@@ -400,7 +409,9 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    shift_computed_tokens=(
+                        1 if (self.use_eagle and spec_decode_enabled) else 0
+                    ),
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -429,10 +440,13 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
+                    active_lookahead = (
+                        self.num_lookahead_tokens if spec_decode_enabled else 0
+                    )
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=active_lookahead,
                     )
 
                     if new_blocks is not None:
@@ -488,17 +502,18 @@ class Scheduler(SchedulerInterface):
 
             # Speculative decode related.
             if request.spec_token_ids:
-                num_scheduled_spec_tokens = (
-                    num_new_tokens
-                    + request.num_computed_tokens
-                    - request.num_tokens
-                    - request.num_output_placeholders
-                )
-                if num_scheduled_spec_tokens > 0:
-                    spec_token_ids = request.spec_token_ids
-                    if len(spec_token_ids) > num_scheduled_spec_tokens:
-                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                if spec_decode_enabled:
+                    num_scheduled_spec_tokens = (
+                        num_new_tokens
+                        + request.num_computed_tokens
+                        - request.num_tokens
+                        - request.num_output_placeholders
+                    )
+                    if num_scheduled_spec_tokens > 0:
+                        spec_token_ids = request.spec_token_ids
+                        if len(spec_token_ids) > num_scheduled_spec_tokens:
+                            spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+                        scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
@@ -539,6 +554,8 @@ class Scheduler(SchedulerInterface):
 
                 request = self.waiting.peek_request()
                 request_id = request.request_id
+                if not spec_decode_enabled and request.spec_token_ids:
+                    request.spec_token_ids = []
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -681,7 +698,9 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            shift_computed_tokens=(
+                                1 if (self.use_eagle and spec_decode_enabled) else 0
+                            ),
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -703,7 +722,8 @@ class Scheduler(SchedulerInterface):
                 # creates a mismatch between the number
                 # of local and remote blocks.
                 effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                    0 if (request.num_computed_tokens == 0 or not spec_decode_enabled)
+                    else self.num_lookahead_tokens
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -887,6 +907,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            spec_decode_enabled=spec_decode_enabled,
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
 
@@ -1322,6 +1343,8 @@ class Scheduler(SchedulerInterface):
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+                if scheduler_output.spec_decode_enabled
+                else None
             )
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
@@ -1597,6 +1620,9 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        if not self.enable_sd:
+            return
+
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -1621,6 +1647,9 @@ class Scheduler(SchedulerInterface):
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
     ) -> None:
+        if not scheduler_output.spec_decode_enabled:
+            return
+
         num_invalid_spec_tokens: dict[str, int] = {}
 
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -2025,7 +2054,9 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
+            # assert req_id in self.requests
+            if req_id not in self.requests:
+                continue
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
@@ -2034,7 +2065,9 @@ class Scheduler(SchedulerInterface):
                 self._free_blocks(self.requests[req_id])
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
+            # assert req_id in self.requests
+            if req_id not in self.requests:
+                continue
             self._free_blocks(self.requests[req_id])
 
     def _update_requests_with_invalid_blocks(

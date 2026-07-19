@@ -900,6 +900,11 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    async def toggle_speculative_decoding(self, enable: bool) -> bool:
+        return await self.engine_core.call_utility_async(
+            "toggle_speculative_decoding", enable
+        )
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 

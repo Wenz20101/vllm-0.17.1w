@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -485,6 +486,8 @@ class GPUModelRunner(
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
         self.use_aux_hidden_state_outputs = False
+        self._aux_hidden_state_layers: tuple[int, ...] = ()
+        self._aux_hidden_state_outputs_enabled = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -764,6 +767,20 @@ class GPUModelRunner(
             draft_config = self.speculative_config.draft_model_config
             if draft_config is None or draft_config.max_model_len is None:
                 self.effective_drafter_max_model_len = self.max_model_len
+
+    def _set_aux_hidden_state_outputs_enabled(self, enabled: bool) -> None:
+        if not self.use_aux_hidden_state_outputs:
+            return
+        if self._aux_hidden_state_outputs_enabled == enabled:
+            return
+        if enabled:
+            self.model.set_aux_hidden_state_layers(self._aux_hidden_state_layers)
+        # Keep the target model's aux-output schema stable across runtime
+        # toggles. torch.compile/AOT specializes on the observed return
+        # structure, so clearing the model layers here can make later SD
+        # iterations miss aux hidden states. Non-SD mode still ignores the aux
+        # tensors in postprocess.
+        self._aux_hidden_state_outputs_enabled = enabled
 
     def reset_mm_cache(self) -> None:
         """
@@ -1212,7 +1229,11 @@ class GPUModelRunner(
         each sequence, and a shifting is done during the next iteration
         based on the number of accepted tokens.
         """
-        if not self.speculative_config or not self.model_config.is_hybrid:
+        if (
+            not self.speculative_config
+            or not self.model_config.is_hybrid
+            or not scheduler_output.spec_decode_enabled
+        ):
             return
 
         # Find the number of accepted tokens for each sequence.
@@ -1706,7 +1727,10 @@ class GPUModelRunner(
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
-        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        use_spec_decode = (
+            scheduler_output.spec_decode_enabled
+            and len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        )
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -1959,7 +1983,11 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                self.speculative_config
+                and use_spec_decode
+                and spec_decode_common_attn_metadata is None
+            ):
                 if isinstance(self.drafter, EagleProposer):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
@@ -3192,6 +3220,9 @@ class GPUModelRunner(
         force_uniform_decode: bool | None = None,
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
+        uniform_decode_query_len: int | None = None,
+        exact_uniform_decode: bool = False,
+        aux_hidden_state_outputs: bool = False,
         num_encoder_reqs: int = 0,
     ) -> tuple[
         CUDAGraphMode,
@@ -3200,9 +3231,12 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        uniform_decode_query_len = (
+            uniform_decode_query_len or self.uniform_decode_query_len
+        )
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
-            uniform_decode_query_len=self.uniform_decode_query_len,
+            uniform_decode_query_len=uniform_decode_query_len,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
@@ -3229,6 +3263,9 @@ class GPUModelRunner(
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
+                uniform_decode_query_len=uniform_decode_query_len,
+                exact_uniform_decode=exact_uniform_decode,
+                aux_hidden_state_outputs=aux_hidden_state_outputs,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
@@ -3479,6 +3516,22 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            use_spec_decode = scheduler_output.spec_decode_enabled
+            use_aux_hidden_state_outputs = (
+                self.use_aux_hidden_state_outputs and use_spec_decode
+            )
+            target_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+            uniform_decode_query_len = (
+                1
+                if (
+                    use_aux_hidden_state_outputs
+                    and spec_decode_metadata is None
+                    and max_num_scheduled_tokens == 1
+                )
+                else self.uniform_decode_query_len
+                if use_spec_decode
+                else 1
+            )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -3502,8 +3555,18 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                uniform_decode_query_len=uniform_decode_query_len,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                aux_hidden_state_outputs=target_aux_hidden_state_outputs,
             )
+
+            # print(
+            #     "cudagraph_debug "
+            #     f"mode={cudagraph_mode} batch_desc={batch_desc} "
+            #     f"stats={cudagraph_stats} "
+            #     f"use_aux_hidden_state_outputs={use_aux_hidden_state_outputs} "
+            #     f"target_aux_hidden_state_outputs={target_aux_hidden_state_outputs}"
+            # )
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -3558,7 +3621,9 @@ class GPUModelRunner(
                     self._get_mamba_copy_bufs(),
                 )
 
-            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+            self._set_aux_hidden_state_outputs_enabled(
+                target_aux_hidden_state_outputs
+            )
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
@@ -3618,7 +3683,10 @@ class GPUModelRunner(
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, delay clearing connector metadata
         # until after draft model runs in sample_tokens.
-        clear_kv_metadata = self.speculative_config is None
+        clear_kv_metadata = (
+            self.speculative_config is None
+            or not scheduler_output.spec_decode_enabled
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -3645,9 +3713,12 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
+            if isinstance(model_output, tuple):
                 # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
+                hidden_states, raw_aux_hidden_states = model_output
+                aux_hidden_states = (
+                    raw_aux_hidden_states if use_aux_hidden_state_outputs else None
+                )
             else:
                 # Common case.
                 hidden_states = model_output
@@ -3765,6 +3836,30 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        if os.environ.get("VLLM_TOGGLE_DEBUG_SAMPLE") == "1":
+            sampling_metadata = self.input_batch.sampling_metadata
+            debug_rows = min(logits.shape[0], 8)
+            debug_top_vals, debug_top_ids = torch.topk(
+                logits[:debug_rows].float(), k=5, dim=-1
+            )
+            temperatures = (
+                None
+                if sampling_metadata.temperature is None
+                else sampling_metadata.temperature[:debug_rows].detach().cpu().tolist()
+            )
+            # print(
+            #     "sample_debug "
+            #     f"spec_decode_enabled={scheduler_output.spec_decode_enabled} "
+            #     f"cudagraph_stats={cudagraph_stats} "
+            #     f"req_ids={self.input_batch.req_ids[:debug_rows]} "
+            #     f"all_greedy={sampling_metadata.all_greedy} "
+            #     f"all_random={sampling_metadata.all_random} "
+            #     f"temperature={temperatures} "
+            #     f"sampled={sampler_output.sampled_token_ids[:debug_rows].detach().cpu().tolist()} "
+            #     f"top_ids={debug_top_ids.detach().cpu().tolist()} "
+            #     f"top_vals={debug_top_vals.detach().cpu().tolist()}"
+            # )
+
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -3800,7 +3895,7 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
-        if spec_config is not None:
+        if spec_config is not None and scheduler_output.spec_decode_enabled:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
@@ -3810,6 +3905,10 @@ class GPUModelRunner(
                 or spec_config.uses_draft_model()
                 or spec_config.uses_extract_hidden_states()
             ) and not spec_config.disable_padded_drafter_batch
+            missing_aux_hidden_states = (
+                self.use_aux_hidden_state_outputs and aux_hidden_states is None
+            )
+
             if use_gpu_toks:
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
@@ -3818,7 +3917,33 @@ class GPUModelRunner(
                     EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
-                if input_fits_in_drafter:
+                if input_fits_in_drafter and missing_aux_hidden_states:
+                    logger.warning_once(
+                        "EAGLE3 speculative decoding is enabled for this "
+                        "iteration, but the target model forward did not "
+                        "return auxiliary hidden states. Falling back to "
+                        "zero draft tokens for this iteration."
+                    )
+                    assert spec_decode_common_attn_metadata is not None
+                    next_token_ids, valid_sampled_tokens_count = (
+                        self.drafter.prepare_next_token_ids_padded(
+                            spec_decode_common_attn_metadata,
+                            sampled_token_ids,
+                            self.requests,
+                            self.input_batch,
+                            self.discard_request_mask.gpu,
+                        )
+                    )
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
+                    self._draft_token_ids = torch.zeros(
+                        1, device=self.device, dtype=torch.int32
+                    ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                    self._copy_draft_token_ids_to_cpu(
+                        scheduler_output, zeros_only=True
+                    )
+                elif input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
@@ -3869,7 +3994,10 @@ class GPUModelRunner(
         # Clear KV connector metadata after draft model runs (if spec decode).
         # This was deferred from target model forward to allow draft model
         # to also save its KV cache.
-        if self.speculative_config is not None:
+        if (
+            self.speculative_config is not None
+            and scheduler_output.spec_decode_enabled
+        ):
             self.clear_kv_connector_metadata()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
@@ -4347,7 +4475,8 @@ class GPUModelRunner(
                     else:
                         aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
 
-                    self.model.set_aux_hidden_state_layers(aux_layers)
+                    self._aux_hidden_state_layers = aux_layers
+                    self._set_aux_hidden_state_outputs_enabled(True)
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
         except torch.cuda.OutOfMemoryError as e:
@@ -4749,6 +4878,8 @@ class GPUModelRunner(
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
+        uniform_decode_query_len: int | None = None,
+        aux_hidden_state_outputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -4798,7 +4929,18 @@ class GPUModelRunner(
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
-        max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
+        uniform_decode_query_len = (
+            uniform_decode_query_len or self.uniform_decode_query_len
+        )
+        max_query_len = uniform_decode_query_len if uniform_decode else num_tokens
+        use_spec_decode_for_dummy = (
+            self.speculative_config is not None
+            and uniform_decode
+            and uniform_decode_query_len > 1
+        )
+        use_aux_hidden_state_outputs = (
+            self.use_aux_hidden_state_outputs and aux_hidden_state_outputs
+        )
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
@@ -4858,6 +5000,8 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
+                uniform_decode_query_len=uniform_decode_query_len,
+                aux_hidden_state_outputs=aux_hidden_state_outputs,
             )
         )
 
@@ -4927,7 +5071,7 @@ class GPUModelRunner(
                     ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
-                    use_spec_decode=self.speculative_config is not None,
+                    use_spec_decode=use_spec_decode_for_dummy,
                 )
 
         with self.maybe_dummy_run_with_lora(
@@ -4939,6 +5083,9 @@ class GPUModelRunner(
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
+            self._set_aux_hidden_state_outputs_enabled(
+                use_aux_hidden_state_outputs
+            )
             model_kwargs = self._init_model_kwargs()
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
@@ -5007,12 +5154,12 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
 
-            if self.use_aux_hidden_state_outputs:
+            if isinstance(outputs, tuple):
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if use_spec_decode_for_dummy and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -5430,6 +5577,8 @@ class GPUModelRunner(
         for batch_desc in batch_descriptors:
             num_tokens = batch_desc.num_tokens
             num_active_loras = batch_desc.num_active_loras
+            uniform_decode_query_len = batch_desc.uniform_decode_query_len
+            aux_hidden_state_outputs = batch_desc.aux_hidden_state_outputs
 
             # We currently only capture ubatched graphs when its a FULL
             # cudagraph, a uniform decode batch, and the number of tokens
@@ -5458,6 +5607,8 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=CUDAGraphMode.NONE,
                     allow_microbatching=allow_microbatching,
                     num_active_loras=num_active_loras,
+                    uniform_decode_query_len=uniform_decode_query_len,
+                    aux_hidden_state_outputs=aux_hidden_state_outputs,
                 )
 
             # Capture run
@@ -5466,6 +5617,8 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 allow_microbatching=allow_microbatching,
                 num_active_loras=num_active_loras,
+                uniform_decode_query_len=uniform_decode_query_len,
+                aux_hidden_state_outputs=aux_hidden_state_outputs,
                 is_graph_capturing=True,
             )
         self.maybe_remove_all_loras(self.lora_config)

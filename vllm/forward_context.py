@@ -44,6 +44,18 @@ class BatchDescriptor:
     """
     True if all the requests in the batch have the same number of tokens.
     """
+    uniform_decode_query_len: int = 1
+    """
+    Query length for uniform decode cudagraphs. This distinguishes regular
+    decode graphs (1 token/request) from speculative decode graphs
+    (1 + num_speculative_tokens tokens/request).
+    """
+    aux_hidden_state_outputs: bool = False
+    """
+    Whether this graph is captured with auxiliary hidden state outputs enabled.
+    EAGLE3 needs a separate graph from the ordinary target-only forward because
+    the model output structure differs.
+    """
     has_lora: bool = False
     """
     Whether this batch has active LoRA adapters.
