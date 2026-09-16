@@ -376,6 +376,22 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def log_running_batch_size(self):
+        path = os.getenv("VLLM_RUNNING_BATCH_SIZE_CSV")
+        if not path:
+            return
+        now = time.time()
+        left = getattr(self, "_batch_size_log_left", 0)
+        if not left and now - getattr(self, "_batch_size_log_time", 0) >= float(
+            os.getenv("VLLM_RUNNING_BATCH_SIZE_INTERVAL", "60")
+        ):
+            self._batch_size_log_time = now
+            left = int(os.getenv("VLLM_RUNNING_BATCH_SIZE_ITERS", "100"))
+        if left:
+            with open(path, "a") as f:
+                print(f"{now},{self.scheduler.get_request_counts()[0]}", file=f)
+            self._batch_size_log_left = left - 1
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -389,6 +405,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        self.log_running_batch_size()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -455,6 +472,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            self.log_running_batch_size()
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
